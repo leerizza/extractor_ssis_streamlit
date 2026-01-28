@@ -7,7 +7,6 @@ import re
 import os
 from quality_dashboard import render_quality_dashboard
 from sql_refiner import SQLRefiner
-from sql_parser import SQLParser
 
 st.set_page_config(page_title="SSIS Metadata Extractor for Migration", layout="wide")
 
@@ -22,16 +21,14 @@ class SSISMetadataExtractor:
             'SQLTask': 'www.microsoft.com/sqlserver/dts/tasks/sqltask'
         }
         self.variable_map = self._cache_variables()
-        self.variable_map = self._cache_variables()
         self.conn_map = self._cache_connections()
-        self.parser = SQLParser(variable_resolver=self._resolve_sql_variables)
 
     def _cache_connections(self):
         """Cache connection strings for quick lookup by ID and Name"""
         c_map = {}
         ns = '{www.microsoft.com/SqlServer/Dts}'
         
-        for conn in self.root.findall('./DTS:ConnectionManagers/DTS:ConnectionManager', self.namespaces):
+        for conn in self.root.findall('.//DTS:ConnectionManager', self.namespaces):
             conn_id = conn.get(f'{ns}DTSID')
             conn_name = conn.get(f'{ns}ObjectName')
             
@@ -64,59 +61,762 @@ class SSISMetadataExtractor:
                 v_map[f"User::{name}"] = val # Support qualified name
         return v_map
 
-    def _resolve_sql_variables(self, sql_query):
-        """Resolves SSIS variables (e.g. @[User::TableName]) in the SQL query"""
-        if not sql_query or '@[' not in sql_query:
-            return sql_query
+    def _clean_sql_comments(self, sql):
+        """Robustly remove SQL comments (including nested block comments)"""
+        out = []
+        i = 0
+        n = len(sql)
+        depth = 0
+        in_string = False
+        in_line_comment = False
+        
+        while i < n:
+            char = sql[i]
             
-        # Lazy load variables cache
-        if not hasattr(self, '_variables_cache'):
-            try:
-                self._variables_cache = {
-                    f"@[{v['Namespace']}::{v['Variable Name']}]": v['Value'] 
-                    for v in self.get_variables()
-                }
-                # Also add short forms? SSIS usually mostly full Namespace
-                # But let's add no-namespace version just in case of ambiguity?
-                # Actually, standard is @[Namespace::Name]. Sometimes just ? for parameter.
+            # 1. Handle String State
+            if in_string:
+                out.append(char)
+                if char == "'":
+                    # Check for escaped quote ''
+                    if i + 1 < n and sql[i+1] == "'":
+                        out.append("'")
+                        i += 1
+                    else:
+                        in_string = False
+                i += 1
+                continue
                 
-                # Parameters handling (e.g. SQL Command from Variable) often just use the value.
-                # But in "SQL Command" mode with variable, the whole string is the variable.
-                # If "SQL Command" mode with text: "SELECT * FROM " + @[User::Table] -> Expression
-                # Detailed parsing of expressions is hard, but simple string substitution works for direct embedding.
-            except Exception:
-                self._variables_cache = {}
+            # 2. Handle Line Comment State
+            if in_line_comment:
+                if char == '\n':
+                    in_line_comment = False
+                    out.append(char) # Keep newline
+                i += 1
+                continue
+            
+            # 3. Handle Block Comment Internal State (depth > 0)
+            if depth > 0:
+                # Check for nested block comment start
+                if char == '/' and i + 1 < n and sql[i+1] == '*':
+                    depth += 1
+                    i += 2
+                    continue
+                # Check for block comment end
+                if char == '*' and i + 1 < n and sql[i+1] == '/':
+                    depth -= 1
+                    i += 2
+                    continue
+                # Ignore other chars inside comment
+                i += 1
+                continue
+                
+            # 4. Normal State (depth == 0)
+            
+            # Start of Block Comment?
+            if char == '/' and i + 1 < n and sql[i+1] == '*':
+                depth += 1
+                i += 2
+                continue
+                
+            # Start of Line Comment?
+            if char == '-' and i + 1 < n and sql[i+1] == '-':
+                in_line_comment = True
+                i += 2
+                continue
+                
+            # Start of String?
+            if char == "'":
+                in_string = True
+                out.append(char)
+                i += 1
+                continue
+                
+            # Normal char
+            out.append(char)
+            i += 1
+            
+        return "".join(out)
+        
+    def _extract_ctes_and_clean_sql(self, sql_clean):
+        """Helper to strip DECLAREs and extract CTEs, returning (mappings, main_sql)"""
+        subquery_mappings = {} 
 
-        resolved_sql = sql_query
-        
-        # 1. Regex to find @[Namespace::Name] or @[Name]
-        # Pattern: @\[([\w\s]+::[\w\s]+)\]
-        pattern = r'@\[([\w\s:]+)\]'
-        
-        matches = re.findall(pattern, sql_query)
-        for var_ref in matches:
-            full_ref = f"@[{var_ref}]"
-            # Try exact match first
-            if full_ref in self._variables_cache:
-                val = self._variables_cache[full_ref]
-                # Determine if we should quote the value?
-                # If table name, no quotes. If string literal, maybe quotes.
-                # Heuristic: If it looks like a table name (no spaces) don't quote.
-                # Better: Just substitute raw value and let parser succeed or fail.
-                # usually variables for table names are raw names.
-                resolved_sql = resolved_sql.replace(full_ref, val)
+        # PRE-PROCESSING: Remove DECLARE statements to expose WITH/SELECT
+        while re.match(r'^\s*DECLARE\s+', sql_clean, re.IGNORECASE):
+            end_match = re.search(r';', sql_clean)
+            if end_match:
+                sql_clean = sql_clean[end_match.end():].strip()
             else:
-                # Try finding by name ignoring namespace if strict match failed
-                # Not implemented for safety.
-                pass
+                 lines = sql_clean.split('\n', 1)
+                 if len(lines) > 1: sql_clean = lines[1].strip()
+                 else: break
+
+        # PHASE 1: EXTRACT CTEs (WITH clause)
+        with_match = re.match(r'^\s*WITH\s+', sql_clean, re.IGNORECASE)
+        
+        if with_match:
+            cte_section_start = with_match.end()
+            paren_depth = 0
+            main_select_start = -1
+            
+            for i, char in enumerate(sql_clean[cte_section_start:], start=cte_section_start):
+                if char == '(': paren_depth += 1
+                elif char == ')': paren_depth -= 1
+                elif paren_depth == 0:
+                    if sql_clean[i:i+6] == 'SELECT':
+                        main_select_start = i
+                        break
+            
+            if main_select_start != -1:
+                cte_section = sql_clean[cte_section_start:main_select_start].strip()
+                cte_pattern = r'(\w+)\s+AS\s*\('
+                cte_start_pos = 0
                 
-        return resolved_sql
+                while True:
+                    cte_match = re.search(cte_pattern, cte_section[cte_start_pos:], re.IGNORECASE)
+                    if not cte_match: break
+                    
+                    cte_alias = cte_match.group(1).upper()
+                    open_paren_pos = cte_start_pos + cte_match.end() - 1
+                    
+                    paren_count = 1
+                    close_paren_pos = -1
+                    
+                    for i, char in enumerate(cte_section[open_paren_pos + 1:], start=open_paren_pos + 1):
+                        if char == '(': paren_count += 1
+                        elif char == ')': paren_count -= 1
+                        if paren_count == 0:
+                            close_paren_pos = i
+                            break
+                    
+                    if close_paren_pos != -1:
+                        cte_sql = cte_section[open_paren_pos + 1:close_paren_pos]
+                        subquery_mappings[cte_alias] = self.parse_sql_column_sources(cte_sql)
+                        cte_start_pos = close_paren_pos + 1
+                    else: break
+                
+                sql_clean = sql_clean[main_select_start:].strip()
+                
+        return subquery_mappings, sql_clean
 
-        # Parsing logic moved to SQLParser class
+    def extract_join_keys(self, sql_query):
+        """Extract columns used in JOIN ON clauses"""
+        if not sql_query or sql_query == 'N/A': return []
+        
+        # 1. Parse CTEs to understand aliases
+        subquery_mappings, sql_clean = self._extract_ctes_and_clean_sql(self._clean_sql_comments(sql_query).upper().strip())
+        
+        # 1.5 Parse Table Aliases in Main Query
+        table_aliases = {}
+        # Pattern handles: FROM table alias, JOIN table AS alias
+        table_pattern = r'(?:FROM|JOIN)\s+(?:\[?[\w\.\[\]]+\]?\.)?(?:\[?[\w\.\[\]]+\]?\.)?(\[?[\w_]+\]?)(?:\s+(?:AS\s+)?(\w+))?'
+        
+        for match in re.finditer(table_pattern, sql_clean, re.IGNORECASE):
+            table_name = match.group(1).strip('[]').upper()
+            alias_group = match.group(2)
+            alias = alias_group.upper() if alias_group else table_name
+            
+            if alias in ['LEFT', 'RIGHT', 'INNER', 'OUTER', 'JOIN', 'ON', 'WHERE', 'GROUP', 'ORDER', 'BY', 'SELECT', 'FROM', 'WITH', 'OPTION']:
+                alias = table_name
+                
+            table_aliases[alias] = table_name
+            
+        join_keys = []
+        
+        # 2. Extract ON clauses
+        # Regex to find ON ... until next keyword
+        on_pattern = r'\bON\b\s+(.*?)(?=\b(?:LEFT|RIGHT|INNER|OUTER|JOIN|WHERE|GROUP|ORDER|UNION|OPTION)\b|$)'
+        
+        for match in re.finditer(on_pattern, sql_clean, re.DOTALL | re.IGNORECASE):
+            condition = match.group(1).strip()
+            # print(f"DEBUG: Found ON clause: {condition}")
+            
+            # 3. Extract table.column references
+            col_refs = re.findall(r'([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)', condition)
+            
+            for table_alias, col_name in col_refs:
+                table_alias = table_alias.upper()
+                col_name = col_name.upper()
+                
+                source_table = table_alias
+                source_col = col_name
+                
+                # Resolve Table Alias -> Real Table Name (e.g. A -> T1)
+                real_table_name = table_aliases.get(table_alias, table_alias)
+                source_table = real_table_name # Default to real name
+                
+                # 4. Resolve Aliases using CTE mappings
+                if real_table_name in subquery_mappings:
+                    inner_map = subquery_mappings[real_table_name]
+                    resolved = inner_map.get(col_name)
+                    if resolved:
+                        if isinstance(resolved, dict):
+                            source_table = resolved.get('source_table', source_table)
+                            source_col = resolved.get('source_column', source_col)
+                        else:
+                             # Should not happen with new structure but fallback
+                             pass
+                
+                join_keys.append({
+                    'Original Table Alias': table_alias,
+                    'Original Column': col_name,
+                    'Source Table': source_table,
+                    'Source Column': source_col
+                })
+                
+        return join_keys
+
+    def parse_sql_column_sources(self, sql_query):
+        """Parse SQL query to extract source table for each column with smart inference and recursion"""
+        if not sql_query or sql_query == 'N/A':
+            return {}
+        
+        column_to_table = {}
+        
+        try:
+            # Clean up the SQL (Handle nested comments properly)
+            sql_clean = self._clean_sql_comments(sql_query).upper().strip()
+            
+            # PHASE 0: CHECK FOR STORED PROCEDURES (EXEC)
+            if sql_clean.startswith('EXEC'):
+                # Simple extraction of procedure name (first token after EXEC)
+                # Handles: EXEC dbo.proc, EXECUTE dbo.proc, EXEC @var
+                parts = sql_clean.split()
+                if len(parts) > 1:
+                    proc_name = parts[1]
+                    # Return wildcard mapping so all output columns map to this SP
+                    return {'*': {'source_table': proc_name, 'expression': 'Stored Procedure Result'}}
+            
+            # PHASE 1: EXTRACT CTEs (WITH clause)
+            # Use Helper Method
+            subquery_mappings, sql_clean = self._extract_ctes_and_clean_sql(sql_clean)
+            
+            # PHASE 2: CHECK FOR UNION/UNION ALL
+            # If query has UNION, split into branches and parse each separately
+            # Then merge results (first SELECT defines the column schema)
+            
+            union_branches = []
+            
+            # Find UNION keywords at top level (not inside parentheses)
+            paren_depth = 0
+            union_positions = []
+            
+            i = 0
+            while i < len(sql_clean):
+                if sql_clean[i] == '(':
+                    paren_depth += 1
+                elif sql_clean[i] == ')':
+                    paren_depth -= 1
+                elif paren_depth == 0:
+                    # Check for UNION at top level
+                    if sql_clean[i:i+5] == 'UNION':
+                        # Make sure it's a word boundary
+                        if (i == 0 or not sql_clean[i-1].isalnum()) and \
+                           (i+5 >= len(sql_clean) or not sql_clean[i+5].isalnum()):
+                            union_positions.append(i)
+                i += 1
+            
+            if union_positions:
+                # Split query into branches
+                start_pos = 0
+                for union_pos in union_positions:
+                    branch_sql = sql_clean[start_pos:union_pos].strip()
+                    if branch_sql:
+                        union_branches.append(branch_sql)
+                    
+                    # Skip past "UNION" or "UNION ALL"
+                    next_start = union_pos + 5  # len("UNION")
+                    if sql_clean[next_start:next_start+4].strip().upper() == 'ALL':
+                        next_start += 4
+                    start_pos = next_start
+                
+                # Add last branch
+                last_branch = sql_clean[start_pos:].strip()
+                if last_branch:
+                    union_branches.append(last_branch)
+                
+                # Parse each branch recursively
+                branch_results = []
+                for branch_sql in union_branches:
+                    branch_result = self.parse_sql_column_sources(branch_sql)
+                    branch_results.append(branch_result)
+                
+                # Merge results: First SELECT defines the schema
+                # All branches should have same columns (by SQL UNION rules)
+                if branch_results:
+                    merged_result = {}
+                    first_branch = branch_results[0]
+                    
+                    # For each column in first branch
+                    for col_alias, col_data in first_branch.items():
+                        # Collect source tables from all branches for this column
+                        all_sources = set()
+                        all_source_cols = set()
+                        
+                        for branch_result in branch_results:
+                            if col_alias in branch_result:
+                                branch_col_data = branch_result[col_alias]
+                                if isinstance(branch_col_data, dict):
+                                    all_sources.add(branch_col_data.get('source_table', 'N/A'))
+                                    all_source_cols.add(branch_col_data.get('source_column', col_alias))
+                                else:
+                                    all_sources.add(str(branch_col_data))
+                        
+                        # Merge into single result
+                        if isinstance(col_data, dict):
+                            merged_result[col_alias] = {
+                                'source_table': ', '.join(sorted(all_sources)) if all_sources else 'N/A',
+                                'source_column': ', '.join(sorted(all_source_cols)) if all_source_cols else col_alias,
+                                'expression': col_data.get('expression', '')
+                            }
+                        else:
+                            merged_result[col_alias] = ', '.join(sorted(all_sources)) if all_sources else 'N/A'
+                    
+                    return merged_result
+            
+            # PHASE 3: CHECK FOR SUBQUERIES (Derived Tables) in FROM and JOINs
+            # Logic: Iterate through string to find ALL "(SELECT" blocks
+            # Logic: Iterate through string to find ALL "(SELECT" blocks
+            
+            masked_sql = sql_clean
+            
+            # Find all start indices of "(SELECT" or "( SELECT"
+            # Regex is tricky for finding all overlapping, but we process sequentially.
+            # actually we need to loop until no more (SELECT found that hasn't been masked.
+            
+            while True:
+                # Find first unmasked (SELECT
+                # Look for ( followed by whitespace? followed by SELECT
+                match = re.search(r'\(\s*SELECT', masked_sql, re.IGNORECASE)
+                if not match:
+                    break
+                
+                start_inner = match.start() + 1 # Skip '('
+                
+                # Context Check: Is this a Derived Table (FROM/JOIN) or Scalar Subquery (SELECT list)?
+                prefix_segment = masked_sql[:match.start()].strip()
+                is_derived_context = False
+                if prefix_segment:
+                     # Find last word
+                     last_word_match = re.search(r'(\w+)\s*$', prefix_segment)
+                     if last_word_match:
+                         last_token = last_word_match.group(1).upper()
+                         if last_token in ['FROM', 'JOIN', 'APPLY', 'UPDATE', 'INTO']:
+                              is_derived_context = True
+                
+                # If parsed as UNION branch, the string starts with SELECT, so no FROM before it.
+                # But subquery inside FROM clause: FROM (SELECT ...
+                # So the check holds.
+                
+                # Balanced Parsing to find closing )
+                paren_count = 1
+                end_inner = -1
+                
+                for i, char in enumerate(masked_sql[start_inner:]):
+                    if char == '(':
+                        paren_count += 1
+                    elif char == ')':
+                        paren_count -= 1
+                    
+                    if paren_count == 0:
+                        end_inner = start_inner + i
+                        break
+                
+                if end_inner != -1:
+                    # check if this is actually a subquery we want (has SELECT) - yes regex checked it
+                    inner_sql = masked_sql[start_inner : end_inner]
+                    
+                    # Extract Alias after )
+                    remainder = masked_sql[end_inner+1:]
+                    # Alias is optional [AS] alias
+                    alias_match = re.match(r'^\s*(?:AS\s+)?(\w+)', remainder, re.IGNORECASE)
+                    
+                    sub_alias = None
+                    if alias_match and is_derived_context: # Only extract alias if it's a derived table
+                        sub_alias = alias_match.group(1).upper()
+                        # Ignore keyword aliases just in case
+                        if sub_alias in ['ON', 'JOIN', 'LEFT', 'RIGHT', 'WHERE', 'ORDER', 'GROUP']:
+                            sub_alias = None
+                    
+                    # Recursively Parse only if it's a Derived Table
+                    if sub_alias:
+                        # print(f"DEBUG: Found subquery alias {sub_alias}")
+                        subquery_mappings[sub_alias] = self.parse_sql_column_sources(inner_sql)
+                    
+                    # MASK IT
+                    # We replace providing the same length to preserve other indices? 
+                    # No, we restart search on modified string.
+                    # Replace (SELECT ... ) with (SUBQUERY_PROCESSED)
+                    # We utilize the start/end indices. 
+                    prefix = masked_sql[:match.start()]
+                    suffix = masked_sql[end_inner+1:]
+                    
+                    # If it was a scalar subquery (not derived context), mask differently to avoid table scanner
+                    if is_derived_context:
+                        replacement = " (SUBQUERY_MASK) "
+                    else:
+                        replacement = " (SCALAR_MASK) "
+                        
+                    masked_sql = prefix + replacement + suffix
+                else:
+                    # Malformed? Mismatch parens. Break to avoid infinite loop
+                    break
+
+            # Now parse standard tables from the MASKED sql
+            # The masked SQL contains "SUBQUERY_MASK" instead of (SELECT...)
+            
+            table_aliases = {}
+            # Inject known subquery aliases as special tables
+            for alias in subquery_mappings:
+                # Use a unique name so unique_tables logic works and we can recover the alias
+                table_aliases[alias] = f"SUBQUERY::{alias}"
+            
+            # Standard table pattern
+            table_pattern = r'(?:FROM|JOIN)\s+(?:\[?[\w\.\[\]]+\]?\.)?(?:\[?[\w\.\[\]]+\]?\.)?(\[?[\w_]+\]?)(?:\s+(?:AS\s+)?(\w+))?'
+            
+            for match in re.finditer(table_pattern, masked_sql):
+                table_name = match.group(1).strip('[]')
+                alias_group = match.group(2)
+                alias = alias_group if alias_group else table_name
+                
+                if alias in ['LEFT', 'RIGHT', 'INNER', 'OUTER', 'JOIN', 'ON', 'WHERE', 'GROUP', 'ORDER', 'BY', 'SELECT', 'FROM', 'SUBQUERY_MASK']:
+                     alias = table_name
+                
+                if alias.upper() not in table_aliases:
+                    table_aliases[alias.upper()] = table_name
+            
+            # Determine single table context
+            unique_tables = sorted(list(set(table_aliases.values())))
+            is_single_table = len(unique_tables) == 1
+            
+            default_table = unique_tables[0] if is_single_table else None
+            
+            # Extract SELECT clause robustly (handle nested FROM in subqueries)
+            if 'select_clause' not in locals():
+                select_clause = ""
+                # Find start of SELECT
+                match_sel = re.search(r'SELECT\s+', sql_clean, re.IGNORECASE)
+                
+                if not match_sel:
+                    return subquery_mappings
+                
+                select_start = match_sel.end()
+                
+                # Find all FROM occurrences
+                from_candidates = [m.start() for m in re.finditer(r'\bFROM\b', sql_clean, re.IGNORECASE)]
+                
+                found_from = False
+                for idx in from_candidates:
+                    if idx < select_start: continue
+                    
+                    # Check parens balance in the segment
+                    segment = sql_clean[select_start:idx]
+                    if segment.count('(') == segment.count(')'):
+                         select_clause = segment
+                         found_from = True
+                         break
+                
+                if not found_from:
+                     # No FROM or all FROMs are inside parens? Take reset
+                     # Or maybe just SELECT 1
+                     select_clause = sql_clean[select_start:]
+
+            # Parse columns (handle commas inside parens)
+            columns = []
+            paren_depth = 0
+            current_col = ""
+            for char in select_clause:
+                if char == '(': paren_depth += 1
+                elif char == ')': paren_depth -= 1
+                elif char == ',' and paren_depth == 0:
+                    columns.append(current_col.strip())
+                    current_col = ""
+                    continue
+                current_col += char
+            if current_col.strip(): columns.append(current_col.strip())
+            
+            # Process each column
+            for col in columns:
+                col_alias = None
+                source_tables = set()
+                col_expr = col
+                
+                # Alias Extraction ( =, AS, Implicit) logic...
+                if '=' in col and not col.startswith("'"):
+                     parts = col.split('=', 1)
+                     potential_alias = parts[0].strip()
+                     if ' ' not in potential_alias and '(' not in potential_alias:
+                         col_alias = potential_alias
+                         col_expr = parts[1].strip()
+                
+                if not col_alias:
+                    alias_match = re.search(r'(?:\s+AS\s+|\s+)((?:\[[^\]]+\])|(?:[\w]+))\s*$', col, re.IGNORECASE)
+                    if alias_match:
+                        found_alias = alias_match.group(1)
+                        keywords = ['END', 'ZS', 'AS', 'AND', 'OR', 'IS', 'NULL', 'NOT']
+                        if found_alias.upper() not in keywords:
+                            col_alias = found_alias
+                            col_expr = col[:alias_match.start()].strip()
+                    
+                    if not col_alias:
+                         col_expr = col.strip()
+                         if '.' in col_expr: col_alias = col_expr.split('.')[-1].strip('[]')
+                         else: col_alias = col_expr.strip('[]')
+
+                # RESOLVE SOURCE
+                final_source_table = set()
+                final_source_col = set()
+                
+                # 0. Check for Scalar Subquery in SELECT list
+                # Pattern: (SELECT ... )
+                col_expr_clean = col_expr.strip().upper()
+                # Simple check: starts with ( and contains SELECT nearby
+                if col_expr_clean.startswith('(') and 'SELECT' in col_expr_clean[:20]:
+                    # Try to extract inner SQL
+                    inner_content = col_expr.strip()
+                    if inner_content.startswith('(') and inner_content.endswith(')'):
+                         inner_content = inner_content[1:-1].strip()
+                    
+                    if inner_content.upper().startswith('SELECT'):
+                        # Recursive Parse
+                        # print(f"DEBUG: Found Scalar Subquery in {col_alias}: {inner_content[:30]}...")
+                        sub_result = self.parse_sql_column_sources(inner_content)
+                        
+                        # Merge results - usually a scalar subquery returns 1 col, but could be wild
+                        for sub_col, sub_meta in sub_result.items():
+                             if isinstance(sub_meta, dict):
+                                 t = sub_meta.get('source_table', 'N/A')
+                                 c = sub_meta.get('source_column', sub_col)
+                                 if t != 'N/A': final_source_table.add(t)
+                                 if c != 'N/A': final_source_col.add(c)
+                             else:
+                                 final_source_table.add(str(sub_meta))
+                
+                # 1. References a subquery alias?
+                # Look for alias.column where alias is in subquery_mappings
+                
+                # Helper: Extract ALL table.column references from expression
+                def extract_column_refs(expr):
+                    """Extract all table.column references from complex expressions"""
+                    refs = []
+                    # Pattern: word.word (table.column)
+                    # Handles: table.col, ISNULL(table.col), CASE WHEN table.col...
+                    pattern = r'\b([a-zA-Z_][\w]*)\s*\.\s*([a-zA-Z_][\w]*)\b'
+                    for match in re.finditer(pattern, expr, re.IGNORECASE):
+                        table_ref = match.group(1).upper()
+                        col_ref = match.group(2).upper()
+                        refs.append((table_ref, col_ref))
+                    return refs
+                
+                # Extract all column references from the expression
+                column_refs = extract_column_refs(col_expr)
+                found_explicit_ref = False
+                
+                if column_refs:
+                    # We have explicit table.column references
+                    for table_ref, col_ref in column_refs:
+                        # Check if this reference is a Subquery Alias
+                        if table_ref in subquery_mappings:
+                             found_explicit_ref = True
+                             inner_map = subquery_mappings[table_ref]
+                             resolved_data = inner_map.get(col_ref)
+                             
+                             if resolved_data:
+                                 if isinstance(resolved_data, dict):
+                                     final_source_table.add(resolved_data.get('source_table', 'Unknown'))
+                                     final_source_col.add(resolved_data.get('source_column', col_ref))
+                                 else:
+                                     final_source_table.add(str(resolved_data))
+                                     final_source_col.add(col_ref)
+                             else:
+                                 wildcard_data = inner_map.get('*')
+                                 if wildcard_data: 
+                                     if isinstance(wildcard_data, dict):
+                                         final_source_table.add(wildcard_data.get('source_table', 'Unknown'))
+                                         final_source_col.add(col_ref) 
+                                     else:
+                                         final_source_table.add(str(wildcard_data))
+                                         final_source_col.add(col_ref)
+                                 else: 
+                                     final_source_table.add(f"Subquery({table_ref})")
+                                     final_source_col.add(col_ref)
+                        
+                        # Check if standard table alias
+                        elif table_ref in table_aliases:
+                            found_explicit_ref = True
+                            t_name = table_aliases[table_ref]
+                            
+                            # Check if the resolved table name is actually a CTE/Subquery
+                            if t_name in subquery_mappings:
+                                inner_map = subquery_mappings[t_name]
+                                resolved_data = inner_map.get(col_ref)
+                                
+                                if resolved_data:
+                                     if isinstance(resolved_data, dict):
+                                         final_source_table.add(resolved_data.get('source_table', 'Unknown'))
+                                         final_source_col.add(resolved_data.get('source_column', col_ref))
+                                     else:
+                                         final_source_table.add(str(resolved_data))
+                                         final_source_col.add(col_ref)
+                                else:
+                                     # Wildcard fallback
+                                     wildcard_data = inner_map.get('*')
+                                     if wildcard_data:
+                                          if isinstance(wildcard_data, dict):
+                                              final_source_table.add(wildcard_data.get('source_table', 'Unknown'))
+                                              final_source_col.add(col_ref)
+                                          else:
+                                              final_source_table.add(str(wildcard_data))
+                                              final_source_col.add(col_ref)
+                                     else:
+                                          final_source_table.add(f"Subquery({t_name})")
+                                          final_source_col.add(col_ref)
+
+                            elif t_name.startswith("SUBQUERY::"):
+                                 final_source_table.add("Subquery")
+                                 final_source_col.add(col_ref)
+                            else:
+                                final_source_table.add(t_name)
+                                final_source_col.add(col_ref)
+                
+                # 2. Smart Inference (if no specific alias ref found)
+                if not found_explicit_ref:
+                     # Helper to resolving from a potential subquery if ambiguous or default
+                     def resolve_from_subquery(s_alias, c_expr):
+                         inner_c = c_expr.strip('[]').upper()
+                         if '.' in c_expr: inner_c = c_expr.split('.')[-1].strip('[]').upper()
+                         
+                         if s_alias in subquery_mappings:
+                             i_map = subquery_mappings[s_alias]
+                             return i_map.get(inner_c, i_map.get('*', None))
+                         return None
+
+                     # Standard inference logic
+                     is_literal = (col_expr.startswith("'") and col_expr.endswith("'")) or \
+                                  col_expr.replace('.','',1).isdigit() or \
+                                  col_expr.upper() == 'NULL'
+                                  
+                     if not is_literal and not final_source_table:
+                         if is_single_table:
+                             # Check if Default Table is a Subquery wrapper
+                             if default_table.startswith("SUBQUERY::"):
+                                 real_alias = default_table.split("::")[1]
+                                 if real_alias in subquery_mappings:
+                                     res = resolve_from_subquery(real_alias, col_expr)
+                                     if res and isinstance(res, dict):
+                                         final_source_table.add(res.get('source_table', 'Unknown'))
+                                         final_source_col.add(res.get('source_column', 'Unknown'))
+                                     elif res:
+                                          final_source_table.add(str(res))
+                                          final_source_col.add(col_expr)
+                                     else: 
+                                         final_source_table.add(f"Subquery({real_alias})")
+                                         final_source_col.add(col_expr)
+                             elif default_table in subquery_mappings: # Fallback
+                                 res = resolve_from_subquery(default_table, col_expr)
+                                 if res and isinstance(res, dict):
+                                     final_source_table.add(res.get('source_table', 'Unknown'))
+                                     final_source_col.add(res.get('source_column', 'Unknown'))
+                                 elif res:
+                                     final_source_table.add(str(res))
+                                     final_source_col.add(col_expr)
+                                 else:
+                                     final_source_table.add(f"Subquery({default_table})")
+                                     final_source_col.add(col_expr)
+                             else:
+                                 final_source_table.add(default_table)
+                                 # If single table, assume col_expr is the column name
+                                 final_source_col.add(col_expr)
+                         elif unique_tables:
+                             # Ambiguous
+                             for t in unique_tables:
+                                 if t.startswith("SUBQUERY::"):
+                                      real_alias = t.split("::")[1]
+                                      if real_alias in subquery_mappings:
+                                          res = resolve_from_subquery(real_alias, col_expr)
+                                          if res and isinstance(res, dict):
+                                              final_source_table.add(res.get('source_table', 'Unknown'))
+                                              final_source_col.add(res.get('source_column', 'Unknown'))
+                                          elif res:
+                                              final_source_table.add(str(res))
+                                              final_source_col.add(col_expr)
+                                          else: 
+                                              final_source_table.add(f"Subquery({real_alias})")
+                                              final_source_col.add(col_expr)
+                                 elif t in subquery_mappings:
+                                      res = resolve_from_subquery(t, col_expr)
+                                      if res and isinstance(res, dict):
+                                          final_source_table.add(res.get('source_table', 'Unknown'))
+                                          final_source_col.add(res.get('source_column', 'Unknown'))
+                                      elif res:
+                                          final_source_table.add(str(res))
+                                          final_source_col.add(col_expr)
+                                      else:
+                                          final_source_table.add(f"Subquery({t})")
+                                          final_source_col.add(col_expr)
+                                 else:
+                                      final_source_table.add(t)
+                                      final_source_col.add(col_expr)
+
+                # Register Rich Metadata
+                col_alias_clean = col_alias.strip('[]').upper()
+                
+                # Format Result
+                res_table = ', '.join(sorted(final_source_table)) if final_source_table else 'Expression/Literal'
+                res_col = ', '.join(sorted(final_source_col)) if final_source_col else 'Calculated'
+                
+                # Cleanup res_col (remove table alias prefixes from column names for display)
+                # e.g. "mc.Region" -> "Region" if table is known
+                clean_cols = []
+                for c in res_col.split(','):
+                    c = c.strip()
+                    if '.' in c: clean_cols.append(c.split('.')[-1])
+                    else: clean_cols.append(c)
+                res_col_clean = ', '.join(sorted(set(clean_cols)))
+                
+                column_to_table[col_alias_clean] = {
+                    'source_table': res_table,
+                    'source_column': res_col_clean,
+                    'expression': col_expr
+                }
+            
+            # Propagate wildcard (expand *)
+            if '*' in columns or (len(columns) == 1 and columns[0] == '*'):
+                 # If single table, try to expand from subquery schema
+                 if is_single_table and default_table.startswith("SUBQUERY::"):
+                      real_alias = default_table.split("::")[1]
+                      if real_alias in subquery_mappings:
+                           # Expand ALL columns from the subquery
+                           sub_mapping = subquery_mappings[real_alias]
+                           for sub_col, sub_data in sub_mapping.items():
+                               # Skip the wildcard key itself if we are expanding explicit columns
+                               if sub_col == '*' and len(sub_mapping) > 1:
+                                   continue
+                                   
+                               column_to_table[sub_col] = sub_data
+                 
+                 elif is_single_table and default_table in subquery_mappings:
+                      # Expand from CTE or standard subquery
+                      sub_mapping = subquery_mappings[default_table]
+                      for sub_col, sub_data in sub_mapping.items():
+                           if sub_col == '*' and len(sub_mapping) > 1:
+                               continue
+                           column_to_table[sub_col] = sub_data
+                 
+                 else:
+                      # Just mark * as from default table
+                      if default_table:
+                          column_to_table['*'] = {
+                              'source_table': default_table,
+                              'source_column': '*', 
+                              'expression': 'SELECT *'
+                          }
 
 
-    # Parsing logic moved to SQLParser class
-
+        except Exception as e:
+            pass
+        
+        return column_to_table
     
     def get_package_info(self):
         """Extract basic package information"""
@@ -140,8 +840,7 @@ class SSISMetadataExtractor:
         connections = []
         ns = '{www.microsoft.com/SqlServer/Dts}'
         
-        for conn in self.root.findall('./DTS:ConnectionManagers/DTS:ConnectionManager', self.namespaces):
-            st.toast(f"Found CM: {conn.get(f'{ns}ObjectName')}")
+        for conn in self.root.findall('.//DTS:ConnectionManager', self.namespaces):
             conn_name = conn.get(f'{ns}ObjectName')
             conn_type = conn.get(f'{ns}CreationName')
             conn_id = conn.get(f'{ns}DTSID')
@@ -319,7 +1018,7 @@ class SSISMetadataExtractor:
                 # Parse SQL to get column-to-table mapping
                 column_to_table_map = {}
                 if sql_command:
-                    column_to_table_map = self.parser.parse_sql_column_sources(sql_command)
+                    column_to_table_map = self.parse_sql_column_sources(sql_command)
                 
                 # Get output columns
                 output_columns = []
@@ -343,18 +1042,7 @@ class SSISMetadataExtractor:
                             # (Important if aliases are used in the component)
                             ext_ref = col.get('externalMetadataColumnId')
                             lookup_col_name = col_name
-                            
-                            # Check for Lookup Reference Column (Optimization)
-                            # Lookup components map output to reference column via this property
-                            copy_ref = None
-                            for prop in col.findall('.//property', {}):
-                                if prop.get('name') == 'CopyFromReferenceColumn':
-                                    copy_ref = prop.text
-                                    break
-                            
-                            if copy_ref:
-                                lookup_col_name = copy_ref
-                            elif ext_ref and ext_ref in ext_meta_map:
+                            if ext_ref and ext_ref in ext_meta_map:
                                 lookup_col_name = ext_meta_map[ext_ref]
                             
                             col_type = col.get('dataType', '')
@@ -938,97 +1626,10 @@ class SSISMetadataExtractor:
         try:
             return self._trace_column_lineage_topology()
         except Exception as e:
+            # Fallback to legacy method if graph fails? 
+            # Or just return empty and log?
             print(f"Graph Lineage Failed: {e}")
             return []
-
-    def get_unused_columns(self):
-        """Identify columns from Sources that are NOT used in any Destination"""
-        unused_report = []
-        
-        # 1. Get all available source columns
-        sources = self.get_dataflow_sources()
-        
-        # 2. Get all used lineage
-        lineage = self.get_column_lineage()
-        
-        # Map Source Component -> Set of Used Columns
-        used_cols_map = defaultdict(set)
-        for l in lineage:
-            src_comp = l.get('Source Component')
-            # Use 'Source Column' (which maps to Original Column usually)
-            # But wait, source['Output Columns'] has matches.
-            # In _trace_column_lineage_topology:
-            # 'Source Table': col_config['Source Table'],
-            # 'Original Column': col_config['Original Column'],
-            # The 'Original Column' is what comes from SQL Parser.
-            
-            # Let's check what source['Output Columns'] contains.
-            # It contains 'Column Alias', 'Source Column', 'Original Column'.
-            # 'Column Alias' is the name in the data flow.
-            # Lineage tracking traces LineageIDs.
-            
-            # Key to match: The 'Column Alias' from Source Config VS... wait.
-            # In trace topology: 
-            # col_config = next((c for c in src_config['Output Columns'] if c['Column Alias'] == name), None)
-            
-            # So if a column is in lineage, it was matched by 'Column Alias' (name).
-            # We can just track which LineageIDs from Source were visited?
-            # But LineageIDs are internal.
-            
-            # Simpler: Trace by Source Component + Column Alias.
-            # The lineage result doesn't explicitly store 'Column Alias' of the source output, 
-            # but it stores 'Original Column' (from SQL).
-            
-            # However, if we want to flag "Unused Columns", we usually mean "Columns in SELECT list".
-            # The 'Output Columns' list IS the SELECT list (parsed).
-            
-            # So we need to know which entries in 'Output Columns' were involved in lineage.
-            # Re-running trace might be expensive.
-            
-            # Strategy:
-            # In trace topology, we iterate sources and find matching col_config. 
-            # If we just checked which col_configs were accessed, we'd know.
-            
-            # Post-processing Strategy:
-            # Lineage items have 'Source Component', 'Source Table', 'Original Column'.
-            # Source items have 'Component Name', 'Output Columns' -> [{'Column Alias', 'Source Table', 'Original Column'}]
-            
-            # We can match on (SourceTable, OriginalColumn) tuple? 
-            # Or just (Original Column) if distinct enough per component.
-            
-            if src_comp:
-                orig_col = l.get('Source Column') # This is actually 'Original Column' in lineage dict key
-                if orig_col:
-                    used_cols_map[src_comp].add(orig_col.upper())
-                    
-        for val in sources:
-            comp_name = val['Component Name']
-            used_set = used_cols_map.get(comp_name, set())
-            
-            unused_in_source = []
-            for col in val['Output Columns']:
-                # What is the unique identifier? 'Original Column' or 'Column Alias'?
-                # 'Original Column' comes from SQL logic.
-                # 'Column Alias' is the OutputColumn name. 
-                # If 'Column Alias' differs, lineage trace used 'Column Alias' to find the config, 
-                # then stamped 'Original Column' into the lineage result.
-                
-                # So if we have 'Original Column' in lineage, we match against 'Original Column' here.
-                orig = col.get('Original Column')
-                if orig and orig != 'N/A':
-                    if orig.upper() not in used_set:
-                        # Double check if it's expression/calculated?
-                        if col.get('Source Table') != 'Expression/Literal':
-                             unused_in_source.append(orig)
-            
-            if unused_in_source:
-                unused_report.append({
-                    'Source Component': comp_name,
-                    'Unused Count': len(unused_in_source),
-                    'Unused Columns': ", ".join(sorted(unused_in_source))
-                })
-                
-        return unused_report
 
     def refine_package_sql(self):
         """
@@ -1093,183 +1694,54 @@ class SSISMetadataExtractor:
         return changes
 
 # File uploader
-
-# @st.cache_data(show_spinner=False)
-def process_package_metadata(xml_content):
-    """
-    Process package content and return all metadata.
-    Cached to prevent re-processing on re-runs.
-    """
-    extractor = SSISMetadataExtractor(xml_content)
-    
-    return {
-        'info': extractor.get_package_info(),
-        'connections': extractor.get_connections(),
-        'variables': extractor.get_variables(),
-        'executables': extractor.get_executables(),
-        'sources': extractor.get_dataflow_sources(),
-        'destinations': extractor.get_dataflow_destinations(),
-        'transformations': extractor.get_transformations(),
-        'lineage': extractor.get_column_lineage(),
-        'unused': extractor.get_unused_columns()
-    }
-
-def render_package_details(extractor, metadata, file_path=None):
-    """Render details for a single package using the extractor instance and pre-computed metadata"""
-    
-    package_info = metadata['info']
-    connections = metadata['connections']
-    variables = metadata['variables']
-    executables = metadata['executables']
-    sources = metadata['sources']
-    destinations = metadata['destinations']
-    transformations = metadata['transformations']
-    lineage = metadata['lineage']
+def render_package_details(extractor, file_path=None):
+    """Render details for a single package using the extractor instance"""
+    # ... (existing extractions) ...
+    package_info = extractor.get_package_info()
+    connections = extractor.get_connections()
+    variables = extractor.get_variables()
+    executables = extractor.get_executables()
+    sources = extractor.get_dataflow_sources()
+    destinations = extractor.get_dataflow_destinations()
+    transformations = extractor.get_transformations()
+    lineage = extractor.get_column_lineage()
     
     # Package Info (Updated Design)
     # Package Info
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Package Name", package_info['Package Name'])
-    # ... (rest of the function uses these variables, so no changes needed typically?)
-    # Wait, render_package_details implementation in file might call extractor.get_X() 
-    # I need to ensure the variables extracted above are mostly what's used.
-    # Looking at the view_file output from earlier, the function assigned these vars at the start.
-    # So replacing just the start is sufficient!
-
     with col2:
-        st.metric("Creator", package_info['CreatorName'])
+        st.metric("Creator", package_info['Creator'])
     with col3:
-        st.metric("Created Date", package_info['CreationDate'])
-        
-    # Tabs for Organization
-    tab1, tab2, tab3, tab4, tab5, tab_qual, tab6, tab7, tab_refine, tab_sp, tab8 = st.tabs([
-        "🔌 Connections", 
-        "📥 Data Sources", 
-        "📤 Destinations", 
-        ":arrows_counterclockwise: Transformations", 
+        st.metric("Version", package_info['Version Build'])
+    
+    with st.expander("📋 Full Package Details"):
+        st.json(package_info)
+    
+    st.divider()
+    
+    # Create tabs
+    # Create tabs
+    tabs = st.tabs([
+        "🔌 Connections",
+        "📥 Sources", 
+        "📤 Destinations",
+        "🔄 Transformations",
         "🔗 Column Lineage",
-        "🛡️ Quality & Validation",
-        "Variables",
-        "Tasks",
+        "🛡️ Quality & Stats",
+        "⚙️ Variables",
+        "📋 Tasks",
         "🛠️ SQL Refiner",
-        "🔍 SP Analyzer",
         "💾 Export"
     ])
-
-    # ... (Existing tabs content) ...
-
-    with tab_sp:
-        st.subheader("🔍 Manual Stored Procedure Analyzer")
-        st.markdown("Paste your `.sql` script here to reverse-engineer its lineage.")
-        
-        sp_content = st.text_area("SQL Script / Stored Procedure", height=300, 
-            help="Paste the CREATE PROCEDURE or full SQL script here.",
-            key=f"txt_sp_{package_info['Package Name']}")
-            
-        if st.button("Analyze Stored Procedure Lineage", key=f"btn_sp_analyze_{package_info['Package Name']}"):
-            if sp_content:
-                # Use standard SQLParser
-                parser = SQLParser()
-                statements = sp_content.split(';')
-                
-                lineage_steps = []
-                
-                for idx, stmt in enumerate(statements):
-                    stmt = stmt.strip()
-                    if not stmt: continue
-                    
-                    # Extract metadata using new robust parser
-                    meta = parser.extract_statement_metadata(stmt)
-                    if meta and meta['Operation'] != 'UNKNOWN':
-                        meta['Step ID'] = idx
-                        meta['Statement Snippet'] = stmt[:100] + "..." if len(stmt)>100 else stmt
-                        lineage_steps.append(meta)
-                
-                if lineage_steps:
-                    st.success(f"Successfully extracted {len(lineage_steps)} operations!")
-                    
-                    # 1. Summary Table
-                    summary_data = []
-                    for step in lineage_steps:
-                        summary_data.append({
-                            'Step': step['Step ID'],
-                            'Operation': step['Operation'],
-                            'Destination': step['Destination'],
-                            'Sources': ", ".join(step['Sources'])
-                        })
-                    
-                    st.markdown("### 📋 Process Overview")
-                    st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
-                    
-                    # 2. Detailed Breakdown with Column Provenance
-                    st.markdown("### 🕵️ Step-by-Step Provenance")
-                    
-                    for step in lineage_steps:
-                        with st.expander(f"Step {step['Step ID']}: {step['Operation']} -> {step['Destination']}", expanded=True):
-                            st.code(step['Statement Snippet'], language='sql')
-                            
-                            if step['Columns']:
-                                st.write("**Column Lineage:**")
-                                # Convert Columns dict to DataFrame
-                                col_data = []
-                                for tgt, info in step['Columns'].items():
-                                    if isinstance(info, dict):
-                                        col_data.append({
-                                            'Target Column': tgt,
-                                            'Source Column': info.get('source_column', 'N/A'),
-                                            'Source Table': info.get('source_table', 'N/A'),
-                                            'Expression': info.get('expression', '')
-                                        })
-                                    else:
-                                        # Legacy/Simple format
-                                        col_data.append({
-                                            'Target Column': tgt,
-                                            'Source Column': 'N/A',
-                                            'Source Table': str(info),
-                                            'Expression': ''
-                                        })
-                                
-                                df_cols = pd.DataFrame(col_data)
-                                st.dataframe(df_cols, use_container_width=True)
-                            
-                                # NEW: Display Join Keys
-                                if step.get('Join Keys'):
-                                    st.caption("🧩 Join Logic & Keys")
-                                    df_joins = pd.DataFrame(step['Join Keys'])
-                                    # Reorder for clarity
-                                    join_cols = ['Original Table Alias', 'Original Column', 'Source Table', 'Source Column']
-                                    final_join_cols = [c for c in join_cols if c in df_joins.columns]
-                                    st.dataframe(df_joins[final_join_cols], use_container_width=True)
-                            else:
-                                st.info("No explicit column mappings found (Wildcard or simple operation)")
-                    
-                    # 3. Viz
-                    import graphviz
-                    g = graphviz.Digraph()
-                    g.attr(rankdir='LR')
-                    
-                    for step in lineage_steps:
-                        dest_clean = re.sub(r'[^a-zA-Z0-9_]', '_', step['Destination'])
-                        g.node(dest_clean, label=step['Destination'], shape='box', style='filled', color='lightblue')
-                        
-                        for src in step['Sources']:
-                            src_clean = re.sub(r'[^a-zA-Z0-9_]', '_', src)
-                            g.node(src_clean, label=src, shape='ellipse', color='lightgrey')
-                            g.edge(src_clean, dest_clean, label=step['Operation'])
-                    
-                    st.graphviz_chart(g)
-                    
-                else:
-                    st.warning("No standard operations (INSERT/UPDATE/SELECT INTO) detected.")
-            else:
-                st.warning("Please paste the SQL script first.")
-
-    with tab8:
+    tab1, tab2, tab3, tab4, tab5, tab_qual, tab6, tab7, tab_refine, tab8 = tabs
+    
+    with tab1:
         st.subheader("Connection Managers")
         if connections:
             df_conn = pd.DataFrame(connections)
-            st.dataframe(df_conn, use_container_width=True, height=300)
+            st.dataframe(df_conn, use_container_width=True, height=400)
             
             st.download_button(
                 "📥 Download Connections CSV",
@@ -1308,18 +1780,6 @@ def render_package_details(extractor, metadata, file_path=None):
                         if source['SQL Query'] != 'N/A':
                             st.write("**SQL Query:**")
                             st.code(source['SQL Query'], language='sql')
-                            
-                            # NEW: Extract Join Keys for this source
-                            try:
-                                join_keys = extractor.parser.extract_join_keys(source['SQL Query'])
-                                if join_keys:
-                                    st.caption("🧩 Join Logic & Keys (Auto-Detected)")
-                                    df_joins = pd.DataFrame(join_keys)
-                                    cols = ['Original Table Alias', 'Original Column', 'Source Table', 'Source Column']
-                                    final_cols = [c for c in cols if c in df_joins.columns]
-                                    st.dataframe(df_joins[final_cols], use_container_width=True)
-                            except Exception as e:
-                                pass 
                         
                         if source['Output Columns']:
                             st.write("**Output Columns:**")
@@ -1328,21 +1788,7 @@ def render_package_details(extractor, metadata, file_path=None):
                 
                 st.divider()
         else:
-            # Check for Control Flow SQL Tasks
-            sql_tasks = [
-                e for e in executables 
-                if 'ExecuteSQL' in e['Type'] or 'Execute SQL' in e['Type']
-            ]
-            
-            if sql_tasks:
-                 st.info("ℹ️ No Data Flow Pipeline found. This seems to be a **Control Flow (Stored Procedure)** package.")
-                 st.markdown("### 🛠️ Procedure Calls / SQL Tasks")
-                 
-                 for task in sql_tasks:
-                     with st.expander(f"⚡ {task['Task Name']} ({task['Type']})", expanded=True):
-                         st.code(task['SQL Statement'], language='sql')
-            else:
-                st.info("No data sources found")
+            st.info("No data sources found")
     
     with tab3:
         st.subheader("Destinations")
@@ -1399,13 +1845,12 @@ def render_package_details(extractor, metadata, file_path=None):
                              # or if dest['SQL Query'] was missing. 
                              # Simpler: Just show Join Keys if we have source SQL.
                              try:
-                                 join_keys = extractor.parser.extract_join_keys(source_sql)
+                                 join_keys = extractor.extract_join_keys(source_sql)
                                  if join_keys:
                                      with st.expander("🧩 Join Logic & Keys", expanded=False):
                                          df_joins = pd.DataFrame(join_keys)
                                          cols = ['Original Table Alias', 'Original Column', 'Source Table', 'Source Column']
-                                         final_cols = [c for c in cols if c in df_joins.columns]
-                                         st.dataframe(df_joins[final_cols], use_container_width=True)
+                                         st.dataframe(df_joins[cols], use_container_width=True)
                              except Exception as e:
                                  pass # Silent fail if extraction issues
                                  
@@ -1492,60 +1937,10 @@ def render_package_details(extractor, metadata, file_path=None):
                     df_table = df_lineage[df_lineage['Destination Table'] == dest_table]
                     st.dataframe(df_table, use_container_width=True)
         else:
-            # Check for Control Flow SQL Tasks
-            sql_tasks = [
-                e for e in executables 
-                if 'ExecuteSQL' in e['Type'] or 'Execute SQL' in e['Type']
-            ]
-            
-            if sql_tasks:
-                 st.info("ℹ️ Showing Control Flow Lineage (Stored Procedures)")
-                 import graphviz
-                 g = graphviz.Digraph()
-                 g.attr(rankdir='LR')
-                 
-                 g.node('Start', shape='circle', style='filled', color='lightgrey')
-                 g.node('End', shape='doublecircle', style='filled', color='lightgrey')
-                 
-                 for task in sql_tasks:
-                     t_name = task['Task Name']
-                     # Clean name for dot
-                     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', t_name)
-                     
-                     g.node(safe_name, label=t_name, shape='box', style='filled', color='lightblue')
-                     g.edge('Start', safe_name)
-                     g.edge(safe_name, 'End')
-                     
-                 st.graphviz_chart(g)
-            else:
-                st.info("No column lineage found")
+            st.info("No column lineage found")
     
     with tab_qual:
-        st.subheader("🛡️ Quality & Validation")
-        
-        # 1. Unused Columns Check
-        try:
-            # unused_report = extractor.get_unused_columns() 
-            # Use metadata
-            unused_report = metadata['unused']
-            
-            if unused_report:
-                st.warning(f"Found {len(unused_report)} source components with unused columns!")
-                df_unused = pd.DataFrame(unused_report)
-                st.dataframe(df_unused, use_container_width=True)
-                
-                st.markdown("""
-                > **Optimization Tip:** These columns are fetched from the database but never reach a destination. 
-                > Removing them from the Source Query can improve SSIS performance and reduce network load.
-                """)
-            else:
-                st.success("✅ Clean! All source columns are used in destinations.")
-        except Exception as e:
-            st.error(f"Quality Check Failed: {str(e)}")
-            
-        st.divider()
-        # Keep existing dashboard if needed, or replace entirely.
-        render_quality_dashboard(lineage) # Restored for Lineage Coverage %
+        render_quality_dashboard(lineage)
 
     with tab6:
         st.subheader("Variables")
@@ -1747,18 +2142,12 @@ if packages_to_process:
     try:
         with st.spinner("Extracting metadata..."):
             for fname, content, full_path in packages_to_process:
-                # Use Cached Processing
-                metadata = process_package_metadata(content)
-                
-                # Re-create lightweight extractor for Refinement usage (pass-through)
-                # Or just use a fresh one (Parsing XML is fast)
-                extractor = SSISMetadataExtractor(content) 
-
+                extractor = SSISMetadataExtractor(content)
+                info = extractor.get_package_info()
                 processed_packages.append({
                     'filename': fname,
                     'extractor': extractor,
-                    'metadata': metadata, # metadata dict
-                    'info': metadata['info'],
+                    'info': info,
                     'full_path': full_path
                 })
         
@@ -1781,11 +2170,12 @@ if packages_to_process:
             
             st.divider()
             st.markdown(f"### Currently Viewing: **{selected_pkg['info']['Package Name']}**")
-            render_package_details(selected_pkg['extractor'], selected_pkg['metadata'], selected_pkg['full_path'])
+            render_package_details(selected_pkg['extractor'], selected_pkg['full_path'])
             
     except Exception as e:
         st.error(f"❌ Error during processing: {str(e)}")
         st.exception(e)
+
 else:
     st.info("👈 Select an input mode in the sidebar to get started.")
     

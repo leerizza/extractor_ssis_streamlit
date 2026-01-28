@@ -1,0 +1,41 @@
+package/
+__pycache__/
+.streamlit/
+*.dtsx
+.DS_Store
+venv/
+*.pyc
+
+# Database configuration (contains credentials - NEVER commit!)
+config.json
+
+# Python cache
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test outputs
+test_output/
+*.xlsx
+*.csv
