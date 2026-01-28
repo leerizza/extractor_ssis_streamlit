@@ -3,7 +3,6 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import re
 from collections import defaultdict
-import re
 import os
 from quality_dashboard import render_quality_dashboard
 from sql_refiner import SQLRefiner
@@ -21,7 +20,6 @@ class SSISMetadataExtractor:
             'DTS': 'www.microsoft.com/SqlServer/Dts',
             'SQLTask': 'www.microsoft.com/sqlserver/dts/tasks/sqltask'
         }
-        self.variable_map = self._cache_variables()
         self.variable_map = self._cache_variables()
         self.conn_map = self._cache_connections()
         self.parser = SQLParser(variable_resolver=self._resolve_sql_variables)
@@ -827,8 +825,20 @@ class SSISMetadataExtractor:
                                             expr = prop.text
                                     
                                     if expr:
-                                        # Parse dependencies: [ColName]
-                                        deps = re.findall(r'\[(.*?)\]', expr)
+                                        # Parse dependencies: [ColName] or ColName
+                                        # SSIS Expressions usually use brackets, but some (like C# style) might not?
+                                        # Enhanced Regex: Capture [Brackets] OR \bWords\b
+                                        # Filter out keywords/literals later
+                                        raw_deps = re.findall(r'\[(.*?)\]|\b([a-zA-Z_][\w]*)\b', expr)
+                                        
+                                        deps = []
+                                        for m in raw_deps:
+                                            # m is tuple (bracketed, unbracketed)
+                                            val = m[0] if m[0] else m[1]
+                                            # Filter keywords/literals
+                                            if val and not val.startswith('"') and not val.isnumeric() and val.upper() not in ['TRUE', 'FALSE', 'NULL', 'ISNULL', 'TRIM', 'LEN', 'SUBSTRING', 'GETDATE', 'DATEADD', 'DATEDIFF', 'DT_STR', 'DT_WSTR', 'DT_DBTIMESTAMP', 'DT_I4', 'DT_R8']:
+                                                deps.append(val)
+                                        
                                         # Filter out variables (User::...)
                                         col_deps = [d for d in deps if '::' not in d]
                                         
@@ -845,7 +855,12 @@ class SSISMetadataExtractor:
                                         used_source_keys = set()
                                         for d in col_deps:
                                             # Find input LineageID
+                                            # Try direct name match first
                                             in_lid = input_name_map.get(d)
+                                            # If not found, try case-insensitive?
+                                            if not in_lid:
+                                                 in_lid = next((v for k,v in input_name_map.items() if k.upper() == d.upper()), None)
+
                                             if in_lid and in_lid in lineage_id_map:
                                                 upstream_list = lineage_id_map[in_lid]
                                                 for src in upstream_list:
@@ -924,6 +939,80 @@ class SSISMetadataExtractor:
                                          'Destination Column': target_col,
                                          'Destination Type': in_col.get('cachedDataType', '')
                                      })
+                             elif target_col:
+                                 # FALLBACK: Try to match by Name if LineageID missing
+                                 # Useful for stale packages where IDs are broken but names match
+                                 # We search upstream components in the same Data Flow
+                                 # Find upstream component
+                                 # We need to know which component feeds this input.
+                                 
+                                 # Reverse look up adjacency?
+                                 # input_to_comp maps InputID -> ComponentID.
+                                 # But we need to know who feeds this InputID.
+                                 # paths maps startId (Output) -> endId (Input)
+                                 
+                                 # 1. Find the path ending at this input's ID (or the Input ID itself)
+                                 input_id = inp.get('refId') or inp.get('id')
+                                 upstream_output_id = None
+                                 for path in paths:
+                                     if path.get('endId') == input_id:
+                                         upstream_output_id = path.get('startId')
+                                         break
+                                 
+                                 if upstream_output_id:
+                                      # Find identifying component
+                                      upstream_cid = None
+                                      for c_id, c_comp in components.items():
+                                          for out in c_comp.findall('.//output', {}):
+                                              if (out.get('refId') or out.get('id')) == upstream_output_id:
+                                                  upstream_cid = c_id
+                                                  break
+                                          if upstream_cid: break
+                                      
+                                      if upstream_cid:
+                                          # We found the upstream component.
+                                          # Does it have an output column with this name?
+                                          up_comp = components[upstream_cid]
+                                          up_comp_name = up_comp.get('name')
+                                          
+                                          # Check source config map if it's a source
+                                          if up_comp_name in source_config_map:
+                                               src_cfg = source_config_map[up_comp_name]
+                                               # Match by Output Column Name ~ Target Col Name
+                                               match_col = next((c for c in src_cfg['Output Columns'] if c['Column Alias'].upper() == target_col.upper()), None)
+                                               
+                                               if match_col:
+                                                   lineage_results.append({
+                                                       'Source Component': up_comp_name,
+                                                       'Source Table': match_col['Source Table'],
+                                                       'Original Column': match_col['Original Column'],
+                                                       'Expression/Logic': match_col['Expression/Logic'] + ' (Name Match)',
+                                                       'Source Column': match_col['Original Column'],
+                                                       'Source Type': match_col['Data Type'],
+                                                       'Destination Component': comp_name,
+                                                       'Destination Table': target_table,
+                                                       'Destination Column': target_col,
+                                                       'Destination Type': in_col.get('cachedDataType', '')
+                                                   })
+                                               # Synthetic Fallback for Stale Table Sources
+                                               # If matching failed, but Source is a Table (not Query), assume it exists.
+                                               elif src_cfg.get('Table/View') and src_cfg['Table/View'] != 'N/A' and src_cfg['SQL Query'] == 'N/A':
+                                                    lineage_results.append({
+                                                       'Source Component': up_comp_name,
+                                                       'Source Table': src_cfg['Table/View'],
+                                                       'Original Column': target_col, # Assume same name
+                                                       'Expression/Logic': 'Inferred (Stale Package)',
+                                                       'Source Column': target_col,
+                                                       'Source Type': 'Inferred',
+                                                       'Destination Component': comp_name,
+                                                       'Destination Table': target_table,
+                                                       'Destination Column': target_col,
+                                                       'Destination Type': in_col.get('cachedDataType', '')
+                                                   })
+                                          # Check if it has lineage info mapped by Name?
+                                          # Complex recursive check omitted for brevity,
+                                          # tackling primary use case: Stale Source -> Destination.
+
             
                 # Push downstream
                 for neighbor in adj_list[cid]:
@@ -1018,7 +1107,8 @@ class SSISMetadataExtractor:
                 if orig and orig != 'N/A':
                     if orig.upper() not in used_set:
                         # Double check if it's expression/calculated?
-                        if col.get('Source Table') != 'Expression/Literal':
+                        src_tbl = col.get('Source Table')
+                        if src_tbl not in ['Expression/Literal', 'Expression', 'Literal', 'Static Value', 'Calculation']:
                              unused_in_source.append(orig)
             
             if unused_in_source:
@@ -1114,60 +1204,25 @@ def process_package_metadata(xml_content):
         'unused': extractor.get_unused_columns()
     }
 
-def render_package_details(extractor, metadata, file_path=None):
-    """Render details for a single package using the extractor instance and pre-computed metadata"""
+def render_sql_script_analyzer(package_name="Global"):
+    """
+    Renders the SQL Script Analyzer UI (SPs and Views).
+    Can be used as a standalone tool or as a tab within a package.
+    """
+    st.subheader("📜 SQL Script Analyzer")
     
-    package_info = metadata['info']
-    connections = metadata['connections']
-    variables = metadata['variables']
-    executables = metadata['executables']
-    sources = metadata['sources']
-    destinations = metadata['destinations']
-    transformations = metadata['transformations']
-    lineage = metadata['lineage']
-    
-    # Package Info (Updated Design)
-    # Package Info
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Package Name", package_info['Package Name'])
-    # ... (rest of the function uses these variables, so no changes needed typically?)
-    # Wait, render_package_details implementation in file might call extractor.get_X() 
-    # I need to ensure the variables extracted above are mostly what's used.
-    # Looking at the view_file output from earlier, the function assigned these vars at the start.
-    # So replacing just the start is sufficient!
+    # Split into sub-tabs as requested
+    sub_tab_sp, sub_tab_view = st.tabs(["Stored Procedures", "Views"])
 
-    with col2:
-        st.metric("Creator", package_info['CreatorName'])
-    with col3:
-        st.metric("Created Date", package_info['CreationDate'])
+    # --- Sub-Tab 1: Stored Procedures ---
+    with sub_tab_sp:
+        st.markdown("Paste your `CREATE PROCEDURE` script here to reverse-engineer its lineage.")
         
-    # Tabs for Organization
-    tab1, tab2, tab3, tab4, tab5, tab_qual, tab6, tab7, tab_refine, tab_sp, tab8 = st.tabs([
-        "🔌 Connections", 
-        "📥 Data Sources", 
-        "📤 Destinations", 
-        ":arrows_counterclockwise: Transformations", 
-        "🔗 Column Lineage",
-        "🛡️ Quality & Validation",
-        "Variables",
-        "Tasks",
-        "🛠️ SQL Refiner",
-        "🔍 SP Analyzer",
-        "💾 Export"
-    ])
-
-    # ... (Existing tabs content) ...
-
-    with tab_sp:
-        st.subheader("🔍 Manual Stored Procedure Analyzer")
-        st.markdown("Paste your `.sql` script here to reverse-engineer its lineage.")
-        
-        sp_content = st.text_area("SQL Script / Stored Procedure", height=300, 
-            help="Paste the CREATE PROCEDURE or full SQL script here.",
-            key=f"txt_sp_{package_info['Package Name']}")
+        sp_content = st.text_area("Stored Procedure Script", height=300, 
+            help="Paste the full CREATE PROCEDURE script here.",
+            key=f"txt_sp_{package_name}")
             
-        if st.button("Analyze Stored Procedure Lineage", key=f"btn_sp_analyze_{package_info['Package Name']}"):
+        if st.button("Analyze Stored Procedure", key=f"btn_sp_analyze_{package_name}"):
             if sp_content:
                 # Use standard SQLParser
                 parser = SQLParser()
@@ -1211,7 +1266,6 @@ def render_package_details(extractor, metadata, file_path=None):
                             
                             if step['Columns']:
                                 st.write("**Column Lineage:**")
-                                # Convert Columns dict to DataFrame
                                 col_data = []
                                 for tgt, info in step['Columns'].items():
                                     if isinstance(info, dict):
@@ -1222,7 +1276,6 @@ def render_package_details(extractor, metadata, file_path=None):
                                             'Expression': info.get('expression', '')
                                         })
                                     else:
-                                        # Legacy/Simple format
                                         col_data.append({
                                             'Target Column': tgt,
                                             'Source Column': 'N/A',
@@ -1233,14 +1286,23 @@ def render_package_details(extractor, metadata, file_path=None):
                                 df_cols = pd.DataFrame(col_data)
                                 st.dataframe(df_cols, use_container_width=True)
                             
-                                # NEW: Display Join Keys
                                 if step.get('Join Keys'):
                                     st.caption("🧩 Join Logic & Keys")
                                     df_joins = pd.DataFrame(step['Join Keys'])
-                                    # Reorder for clarity
-                                    join_cols = ['Original Table Alias', 'Original Column', 'Source Table', 'Source Column']
-                                    final_join_cols = [c for c in join_cols if c in df_joins.columns]
-                                    st.dataframe(df_joins[final_join_cols], use_container_width=True)
+                                    # Map new keys to friendly names
+                                    rename_map = {
+                                        'left_table_alias': 'Alias 1',
+                                        'left_table': 'Tabel Source 1',
+                                        'left_column': 'Kolom 1',
+                                        'right_table_alias': 'Alias 2',
+                                        'right_table': 'Tabel Source 2',
+                                        'right_column': 'Kolom 2',
+                                        'join_type': 'Tipe Join'
+                                    }
+                                    df_display = df_joins.rename(columns=rename_map)
+                                    # Show relevant columns
+                                    display_cols = [v for k,v in rename_map.items() if v in df_display.columns]
+                                    st.dataframe(df_display[display_cols], use_container_width=True)
                             else:
                                 st.info("No explicit column mappings found (Wildcard or simple operation)")
                     
@@ -1259,27 +1321,121 @@ def render_package_details(extractor, metadata, file_path=None):
                             g.edge(src_clean, dest_clean, label=step['Operation'])
                     
                     st.graphviz_chart(g)
-                    
                 else:
                     st.warning("No standard operations (INSERT/UPDATE/SELECT INTO) detected.")
             else:
-                st.warning("Please paste the SQL script first.")
+                st.warning("Please paste the Stored Procedure script first.")
 
-    with tab8:
-        st.subheader("Connection Managers")
-        if connections:
-            df_conn = pd.DataFrame(connections)
-            st.dataframe(df_conn, use_container_width=True, height=300)
+    # --- Sub-Tab 2: Views ---
+    with sub_tab_view:
+        st.markdown("Paste your `CREATE VIEW` script here to reverse-engineer its lineage.")
+        
+        view_content = st.text_area("View Script", height=300, 
+            help="Paste the full CREATE VIEW script here.",
+            key=f"txt_view_{package_name}")
             
-            st.download_button(
-                "📥 Download Connections CSV",
-                df_conn.to_csv(index=False),
-                file_name="ssis_connections.csv",
-                mime="text/csv"
-            )
-        else:
-            st.info("No connections found")
+        if st.button("Analyze View Lineage", key=f"btn_view_analyze_{package_name}"):
+            if view_content:
+                parser = SQLParser()
+                # Treat view as single statement usually, but split by ; just in case
+                statements = view_content.split(';')
+                
+                lineage_steps = []
+                
+                for idx, stmt in enumerate(statements):
+                    stmt = stmt.strip()
+                    if not stmt: continue
+                    
+                    meta = parser.extract_statement_metadata(stmt)
+                    if meta and meta['Operation'] != 'UNKNOWN':
+                        meta['Step ID'] = idx
+                        lineage_steps.append(meta)
+                
+                if lineage_steps:
+                    st.success(f"Successfully parse {len(lineage_steps)} View definition(s)!")
+                    
+                    for step in lineage_steps:
+                        with st.expander(f"View: {step['Destination']}", expanded=True):
+                            st.write(f"**Sources:** {', '.join(step['Sources'])}")
+                            
+                            if step['Columns']:
+                                st.write("**Column Lineage:**")
+                                col_data = []
+                                for tgt, info in step['Columns'].items():
+                                    if isinstance(info, dict):
+                                        col_data.append({
+                                            'View Column': tgt,
+                                            'Source Column': info.get('source_column', 'N/A'),
+                                            'Source Table': info.get('source_table', 'N/A'),
+                                            'Expression': info.get('expression', '')
+                                        })
+                                st.dataframe(pd.DataFrame(col_data), use_container_width=True)
+                            
+                            # Join Logic for Views
+                            if step.get('Join Keys'):
+                                st.caption("🧩 Join Logic & Keys")
+                                df_joins = pd.DataFrame(step['Join Keys'])
+                                rename_map = {
+                                    'left_table_alias': 'Alias 1',
+                                    'left_table': 'Tabel Source 1',
+                                    'left_column': 'Kolom 1',
+                                    'right_table_alias': 'Alias 2',
+                                    'right_table': 'Tabel Source 2',
+                                    'right_column': 'Kolom 2',
+                                    'join_type': 'Tipe Join'
+                                }
+                                df_display = df_joins.rename(columns=rename_map)
+                                display_cols = [v for k,v in rename_map.items() if v in df_display.columns]
+                                st.dataframe(df_display[display_cols], use_container_width=True)
+                            
+                            # Simple Graph
+                            import graphviz
+                            g = graphviz.Digraph()
+                            g.attr(rankdir='LR')
+                            dest_clean = re.sub(r'[^a-zA-Z0-9_]', '_', step['Destination'])
+                            g.node(dest_clean, label=step['Destination'], shape='box', style='filled', color='lightblue')
+                            for src in step['Sources']:
+                                src_clean = re.sub(r'[^a-zA-Z0-9_]', '_', src)
+                                g.node(src_clean, label=src, shape='ellipse', color='lightgrey')
+                                g.edge(src_clean, dest_clean, label='SELECT')
+                            st.graphviz_chart(g)
+                else:
+                    st.warning("No CREATE VIEW statement detected.")
+            else:
+                st.warning("Please paste the View definition first.")
+
+def render_package_details(extractor, metadata, file_path=None):
+    """Render details for a single package using the extractor instance and pre-computed metadata"""
     
+    package_info = metadata['info']
+    connections = metadata['connections']
+    variables = metadata['variables']
+    executables = metadata['executables']
+    sources = metadata['sources']
+    destinations = metadata['destinations']
+    transformations = metadata['transformations']
+    lineage = metadata['lineage']
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Package Name", package_info['Package Name'])
+    with col2:
+        st.metric("Creator", package_info['CreatorName'])
+    with col3:
+        st.metric("Created Date", package_info['CreationDate'])
+        
+    tab2, tab3, tab4, tab5, tab_qual, tab6, tab7, tab_refine, tab_sp, tab8 = st.tabs([
+        " Data Sources", 
+        "📤 Destinations", 
+        ":arrows_counterclockwise: Transformations", 
+        "🔗 Column Lineage",
+        "🛡️ Quality & Validation",
+        "Variables",
+        "Tasks",
+        "🛠️ SQL Refiner",
+        "📜 SQL Script Analyzer",
+        "💾 Export"
+    ])
     with tab2:
         st.subheader("Data Sources")
         if sources:
@@ -1485,12 +1641,41 @@ def render_package_details(extractor, metadata, file_path=None):
                 mime="text/csv"
             )
             
+            # Create lookup for Source SQL
+            source_sql_map = {}
+            if sources:
+                for src in sources:
+                    comp_name = src.get('Component Name')
+                    sql = src.get('SQL Query')
+                    if comp_name and sql and sql != 'N/A':
+                        source_sql_map[comp_name] = sql
+
             # Group by destination table
             st.subheader("📊 Lineage by Destination Table")
-            for dest_table in df_lineage['Destination Table'].unique():
+            for dest_table in df_lineage['Destination Table'].astype(str).unique():
                 with st.expander(f"🎯 {dest_table}"):
                     df_table = df_lineage[df_lineage['Destination Table'] == dest_table]
                     st.dataframe(df_table, use_container_width=True)
+                    
+                    # Show Join Keys if available in source SQL
+                    distinct_sources = df_table['Source Component'].dropna().unique()
+                    for src_comp in distinct_sources:
+                        sql = source_sql_map.get(src_comp)
+                        if sql:
+                            try:
+                                join_keys = extractor.parser.extract_join_keys(sql)
+                                if join_keys:
+                                    st.caption(f"🧩 **Join Logic & Keys (Source: `{src_comp}`)**")
+                                    df_joins = pd.DataFrame(join_keys)
+                                    cols = ['Original Table Alias', 'Original Column', 'Source Table', 'Source Column']
+                                    final_cols = [c for c in cols if c in df_joins.columns]
+                                    st.dataframe(df_joins[final_cols], use_container_width=True)
+                                else: # DEBUG
+                                    st.info(f"KEYS EMPTY for {src_comp}")
+                            except Exception as e:
+                                st.error(f"Join extraction error: {e}")
+                        else: # DEBUG 
+                             st.info(f"NO SQL FOUND for {src_comp}")
         else:
             # Check for Control Flow SQL Tasks
             sql_tasks = [
@@ -1642,6 +1827,9 @@ def render_package_details(extractor, metadata, file_path=None):
                         mime="text/xml"
                     )
 
+    with tab_sp:
+        render_sql_script_analyzer(package_name=package_info['Package Name'])
+
     with tab8:
         st.subheader("💾 Export Complete Metadata")
         
@@ -1703,11 +1891,15 @@ Date Extracted: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 # Sidebar
 st.sidebar.header("Input Settings")
-source_mode = st.sidebar.radio("Select Input Mode", ["Upload Files", "Scan Local Folder"])
+source_mode = st.sidebar.radio("Select Input Mode", ["Upload Files", "Scan Local Folder", "Standalone SQL Analyzer"])
 
 packages_to_process = [] # List of (filename, content) keys
 
-if source_mode == "Upload Files":
+if source_mode == "Standalone SQL Analyzer":
+    st.info("Directly analyze Stored Procedures and View definitions.")
+    render_sql_script_analyzer(package_name="Standalone")
+
+elif source_mode == "Upload Files":
     uploaded_files = st.sidebar.file_uploader("Upload SSIS Packages (.dtsx)", type=['dtsx', 'xml'], accept_multiple_files=True)
     if uploaded_files:
         for f in uploaded_files:
