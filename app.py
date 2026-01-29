@@ -287,6 +287,7 @@ class SSISMetadataExtractor:
                 table_name = None
                 access_mode = 0
                 sql_var = None
+                column_to_table_map = {} # Reset map
                 
                 for prop in component.findall('.//property', {}):
                     prop_name = prop.get('name', '')
@@ -314,10 +315,12 @@ class SSISMetadataExtractor:
                         sql_command = resolved_sql
                         comp_desc += f" (From Variable: {sql_var})"
 
-                # Parse SQL to get column-to-table mapping
-                column_to_table_map = {}
                 if sql_command:
-                    column_to_table_map = self.parser.parse_sql_column_sources(sql_command)
+                    # Use fresh parser to avoid cache pollution from complex queries
+                    from sql_parser import SQLParser
+                    local_parser = SQLParser(variable_resolver=self._resolve_sql_variables)
+                    column_to_table_map = local_parser.parse_sql_column_sources(sql_command)
+
                 
                 # Get output columns
                 output_columns = []
@@ -799,6 +802,12 @@ class SSISMetadataExtractor:
                                     # Async Pass-Through by Name
                                     name = out_col.get('name')
                                     src_lid = input_name_map.get(name)
+                                    
+                                    if not src_lid:
+                                        # SSIS often uses cachedName in MergeJoin/Sort
+                                        # Or internal lineage ID mappings? 
+                                        # For now, try case-insensitive and cachedName lookup
+                                        src_lid = next((v for k,v in input_name_map.items() if k.upper() == (name or '').upper()), None)
                                     
                                     if src_lid and src_lid in lineage_id_map:
                                         upstream_list = lineage_id_map[src_lid]
@@ -1911,22 +1920,41 @@ elif source_mode == "Scan Local Folder":
     
     if folder_path:
         if os.path.exists(folder_path) and os.path.isdir(folder_path):
-            files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.dtsx', '.xml'))]
+            files = sorted([f for f in os.listdir(folder_path) if f.lower().endswith(('.dtsx', '.xml'))])
             st.sidebar.success(f"Found {len(files)} package files.")
             
-            # Persist load state
-            if st.sidebar.button("Load Files"):
-                st.session_state['loaded_folder'] = folder_path
+            # User Selection
+            selected_files = st.sidebar.multiselect(
+                "Select Packages to Process",
+                options=files,
+                default=None, # Default to None (empty) as requested
+                help="Select specific packages or remove ones you don't want to process."
+            )
             
-            # Auto-load if path matches stored state
-            if st.session_state.get('loaded_folder') == folder_path:
-                for f in files:
-                    full_path = os.path.join(folder_path, f)
-                    try:
-                        with open(full_path, 'r', encoding='utf-8') as file:
-                            packages_to_process.append((f, file.read(), full_path))
-                    except Exception as e:
-                        st.sidebar.error(f"Error reading {f}: {e}")
+            # Persist load state
+            if st.sidebar.button("Process Selected Packages"):
+                st.session_state['loaded_folder'] = folder_path
+                st.session_state['selected_files'] = selected_files
+            
+            # Clear state if folder changes (optional validation)
+            if st.session_state.get('loaded_folder') != folder_path:
+                if 'selected_files' in st.session_state:
+                    del st.session_state['selected_files']
+
+            # Load logic
+            if st.session_state.get('loaded_folder') == folder_path and 'selected_files' in st.session_state:
+                target_files = st.session_state['selected_files']
+                
+                if not target_files:
+                    st.warning("No packages selected!")
+                else:
+                    for f in target_files:
+                        full_path = os.path.join(folder_path, f)
+                        try:
+                            with open(full_path, 'r', encoding='utf-8') as file:
+                                packages_to_process.append((f, file.read(), full_path))
+                        except Exception as e:
+                            st.sidebar.error(f"Error reading {f}: {e}")
         else:
             st.sidebar.warning("Folder path does not exist or is not a directory.")
 
